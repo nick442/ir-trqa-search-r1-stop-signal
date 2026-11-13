@@ -1,0 +1,508 @@
+diff --git a/c5_task_evaluation/methods/retrieval_augmented_models.py b/c5_task_evaluation/methods/retrieval_augmented_models.py
+index 1d7a3e8..a1c30b0 100644
+--- a/c5_task_evaluation/methods/retrieval_augmented_models.py
++++ b/c5_task_evaluation/methods/retrieval_augmented_models.py
+@@ -23,6 +23,95 @@ from c5_task_evaluation.prompts.prompt_templetes import (
+     get_webpage_to_reasonchain_instruction
+ )
+ 
++# ---------------------------------------------------------------------------
++# [cluster patch] Model loading for small GPUs (e.g. csedu RTX 2080 Ti, 11 GB).
++# The original code loaded the model in bfloat16 onto a single GPU. A 7B model
++# needs ~15 GB in 16-bit, so on 11 GB cards we shard it over 2 GPUs with
++# device_map="auto" and use float16 (Turing GPUs have no native bfloat16).
++# ---------------------------------------------------------------------------
++_DTYPES = {'bf16': torch.bfloat16, 'fp16': torch.float16, 'fp32': torch.float32}
++
++def _resolve_dtype(name):
++    if name in _DTYPES:
++        return _DTYPES[name]
++    # 'auto': bf16 on Ampere+ (what the authors used), fp16 on older GPUs
++    if torch.cuda.is_available():
++        try:
++            native_bf16 = torch.cuda.is_bf16_supported(including_emulation=False)
++        except TypeError:
++            native_bf16 = torch.cuda.get_device_capability()[0] >= 8
++        return torch.bfloat16 if native_bf16 else torch.float16
++    return torch.float32
++
++def _even_device_map(model_name_or_path, n_gpus):
++    """Split the decoder layers evenly over n_gpus (accelerate's "auto" overfills GPU 0,
++    leaving no room for the growing Search-R1 context on 11 GB cards).
++    Embeddings go to the first GPU, final norm + lm_head to the last one."""
++    config = transformers.AutoConfig.from_pretrained(model_name_or_path)
++    n_layers = config.num_hidden_layers
++    per_gpu = -(-n_layers // n_gpus)  # ceil
++    last = n_gpus - 1
++    device_map = {'model.embed_tokens': 0, 'model.rotary_emb': 0, 'model.norm': last,
++                  'lm_head': 0 if getattr(config, 'tie_word_embeddings', False) else last}
++    for i in range(n_layers):
++        device_map[f'model.layers.{i}'] = min(i // per_gpu, last)
++    return device_map
++
++
++def _avoid_sdpa_math_fallback():
++    """On pre-Ampere GPUs (e.g. RTX 2080 Ti) PyTorch has no Flash kernel, and its memory-efficient
++    kernel doesn't support `enable_gqa=True`, which transformers passes for GQA models such as Qwen2.5.
++    SDPA then silently falls back to the math kernel, which materialises the full fp32 attention matrix
++    (memory grows with prompt_length^2 and OOMs at ~4k tokens on 11 GB cards). Expanding the K/V heads
++    ourselves (repeat_kv) gives identical attention and lets the memory-efficient kernel run."""
++    if not torch.cuda.is_available():
++        return False
++    if min(torch.cuda.get_device_capability(i)[0] for i in range(torch.cuda.device_count())) >= 8:
++        return False
++    import transformers.integrations.sdpa_attention as _sdpa
++    _sdpa.use_gqa_in_sdpa = lambda *a, **k: False
++    return True
++
++
++def load_backbone(model_name_or_path, device, args):
++    if _avoid_sdpa_math_fallback():
++        print("[load_backbone] pre-Ampere GPU: disabled SDPA enable_gqa (repeat_kv instead) so the "
++              "memory-efficient attention kernel is used", flush=True)
++    dtype = _resolve_dtype(getattr(args, 'model_dtype', 'auto'))
++    device_map = getattr(args, 'device_map', 'none')
++    quantization = getattr(args, 'quantization', 'none')
++    kwargs = {'dtype': dtype}
++    if quantization != 'none':
++        kwargs['quantization_config'] = transformers.BitsAndBytesConfig(
++            load_in_8bit=(quantization == '8bit'),
++            load_in_4bit=(quantization == '4bit'),
++            bnb_4bit_compute_dtype=dtype,
++        )
++        if device_map == 'none':
++            device_map = 'auto'
++    if device_map != 'none':
++        n_gpus = torch.cuda.device_count()
++        dm = _even_device_map(model_name_or_path, n_gpus) if (device_map == 'even' and n_gpus > 1) else device_map
++        if dm == 'even':
++            dm = 'auto'  # single GPU / CPU: nothing to balance
++        model = transformers.AutoModelForCausalLM.from_pretrained(model_name_or_path, device_map=dm, **kwargs)
++        input_device = model.get_input_embeddings().weight.device
++    else:
++        model = transformers.AutoModelForCausalLM.from_pretrained(model_name_or_path, **kwargs).to(device)
++        input_device = device
++    model.eval()
++    placement = getattr(model, 'hf_device_map', None)
++    print(f"[load_backbone] {model_name_or_path} | dtype={dtype} | quantization={quantization} | "
++          f"device_map={device_map} | input_device={input_device}"
++          + (f" | placement={sorted(set(str(v) for v in placement.values()))}" if placement else "")
++          + f" | attn={getattr(model.config, '_attn_implementation', '?')}", flush=True)
++    if torch.cuda.is_available():
++        for i in range(torch.cuda.device_count()):
++            print(f"[load_backbone] GPU {i}: {torch.cuda.memory_allocated(i) / 2**30:.2f} GiB weights, "
++                  f"{torch.cuda.get_device_properties(i).total_memory / 2**30:.2f} GiB total", flush=True)
++    return model, input_device
++
++
+ class BasicRAG:
+     def __init__(self, device, args):
+         self.args = args
+@@ -31,12 +120,40 @@ class BasicRAG:
+         if args.model_source == 'api':
+             self.generator = LLMGenerator_api(args.model_name_or_path)
+         elif args.model_source == 'hf_local':
+-            backbone_model = transformers.AutoModelForCausalLM.from_pretrained(args.model_name_or_path, dtype=torch.bfloat16).to(device) # attn_implementation="eager"
++            # [cluster patch] dtype / multi-GPU sharding / quantization are configurable, see load_backbone()
++            backbone_model, input_device = load_backbone(args.model_name_or_path, device, args)
+             backbone_tokenizer = transformers.AutoTokenizer.from_pretrained(args.model_name_or_path)
+-            self.generator = LLMGenerator_hf_local(backbone_model, backbone_tokenizer, device, args)
++            self.generator = LLMGenerator_hf_local(backbone_model, backbone_tokenizer, input_device, args)
+         else:
+             raise NotImplementedError
+         
++        # [cluster patch] optional novelty filter: the search tool remembers what it showed for this question
++        self.novelty = None
++        self._last_novelty = None
++        if getattr(args, 'novelty_unit', 'none') != 'none':
++            from c5_task_evaluation.src.novelty_filter import NoveltyFilter, passage_id
++            self._novelty_passage_id = passage_id
++            self.novelty = NoveltyFilter(unit=args.novelty_unit, depth=args.novelty_depth,
++                                         topk=getattr(args, 'retrieval_topk', 3))
++            print(f"[novelty] unit={args.novelty_unit} depth={args.novelty_depth} "
++                  f"topk={self.novelty.topk}", flush=True)
++
++        # [cluster patch] optional stop notice: one line after the passages when the query has nothing new left.
++        # Without the novelty filter the tool only tracks what it showed; with it, fill-ups are switched off.
++        self.stop_notice = bool(getattr(args, 'stop_notice', False))
++        self._shown_tracker = None
++        self._last_notice = None
++        if self.stop_notice:
++            from c5_task_evaluation.src import novelty_filter as _nf
++            self._nf = _nf
++            if self.novelty is None:
++                self._novelty_passage_id = _nf.passage_id
++                self._shown_tracker = _nf.ShownTracker()
++            else:
++                self.novelty.fill = False
++            print(f"[notice] stop notice on | memory={'yes, no fill-ups' if self.novelty is not None else 'no'} "
++                  f"| text={_nf.STOP_NOTICE!r}", flush=True)
++
+         # --- Retrievers 
+         if args.generation_model != "no_retrieval":
+             precomputed_path = getattr(args, 'precomputed_retrieval_path', None)
+@@ -71,9 +188,30 @@ class BasicRAG:
+         topk = getattr(self.args, 'retrieval_topk', 3)
+         docs, scores = self.retriever.search(query, num=eval_k, return_score=True, qid=qid)
+         if not docs:
++            if getattr(self, 'stop_notice', False):  # [cluster patch] a search without hits holds nothing new
++                self._last_notice = self._nf.notice_info(0, 0, True)
+             return [], []
+         ranked_list = list(zip(docs, scores))
++        if self.novelty is not None:
++            # [cluster patch] novelty filter: among the top `novelty_depth` BM25 candidates, show passages
++            # (or documents) not shown before in this question. The shown passages move to ranks 1..k
++            # of ranked_list (used for DRA recall@k) and the rest keeps its BM25 order.
++            order, self._last_novelty = self.novelty.select(
++                [self._novelty_passage_id(d) for d in docs[:self.novelty.depth]])
++            ranked_list = [ranked_list[i] for i in order] + ranked_list[len(order):]
++            docs = [d for d, _ in ranked_list]
++            if not self.novelty.fill:
++                # [cluster patch] memory + notice: no fill-ups, so fewer than topk passages (possibly none)
++                # are shown once the top `novelty_depth` is used up; the notice is given from then on.
++                n_shown = len(self._last_novelty['shown'])
++                self._last_notice = self._nf.notice_info(
++                    n_shown, n_shown, self._last_novelty['n_new_available'] < topk)
++                return docs[:n_shown], ranked_list
+         docs_for_llm = docs[:topk]
++        if self._shown_tracker is not None:
++            # [cluster patch] baseline + notice: the usual top-k; notice when none of them is new in this question
++            n_new = self._shown_tracker.observe([self._novelty_passage_id(d) for d in docs_for_llm])
++            self._last_notice = self._nf.notice_info(len(docs_for_llm), n_new, n_new == 0)
+         return docs_for_llm, ranked_list 
+     
+     def get_think(self, text):
+@@ -193,6 +331,12 @@ class SearchR1_Model(BasicRAG):
+         self.curr_step_template = '\n\n{output_text}<information>{search_results}</information>\n\n'
+         
+     def inference(self, question, generation_temp=0.7, qid=None):
++        if self.novelty is not None:  # [cluster patch] the search tool's memory is per question
++            self.novelty.reset()
++            self._last_novelty = None
++        if self._shown_tracker is not None:  # [cluster patch] same for the notice-only variant
++            self._shown_tracker.reset()
++        self._last_notice = None
+         input_prompt = PROMPT_SEARCHR1.format(question=question)
+         messages = [{"role": "user", "content": input_prompt}]
+         
+@@ -215,6 +359,18 @@ class SearchR1_Model(BasicRAG):
+             step_entry = {'think': self.get_think(output_text), 'search_query': tmp_query, 'docs': search_docs}
+             if ranked_list is not None:
+                 step_entry['ranked_list'] = ranked_list
++            if self._last_novelty is not None:  # [cluster patch] log what the novelty filter did at this step
++                step_entry['novelty'] = self._last_novelty
++                self._last_novelty = None
++            if self._last_notice is not None:  # [cluster patch] stop notice: log it and add the line if given
++                step_entry['notice'] = self._last_notice
++                if self._last_notice['given']:
++                    search_results += self._nf.STOP_NOTICE + '\n'
++                    if os.environ.get('TRQA_DEBUG'):
++                        print(f"[notice] search {sum(1 for s in reasoning_path if s.get('search_query')) + 1}: "
++                              f"{self._last_notice['n_shown']} shown, {self._last_notice['n_new_shown']} new | "
++                              f"<information> ends with {search_results[-90:]!r}", flush=True)
++                self._last_notice = None
+             reasoning_path.append(step_entry)
+             search_text = self.curr_step_template.format(output_text=output_text, search_results=search_results)
+             input_prompt += search_text
+diff --git a/c5_task_evaluation/run_evalution.py b/c5_task_evaluation/run_evalution.py
+index f63499c..a02854b 100644
+--- a/c5_task_evaluation/run_evalution.py
++++ b/c5_task_evaluation/run_evalution.py
+@@ -439,12 +439,23 @@ def run_generation_evaluation(args):
+                         gt_answer = str(answer.get('value', '')) if isinstance(answer, dict) else str(answer)
+                     else:
+                         gt_answer = ''
+-                    if args.generation_method == 'no_retrieval':
+-                        reasoning_path, prediction = model.inference(query)
+-                    elif args.generation_method == 'single_retrieval':
+-                        reasoning_path, prediction = model.inference(query, qid=qid)
+-                    else:
+-                        reasoning_path, prediction = model.inference(query, qid=qid)
++                    try:
++                        if args.generation_method == 'no_retrieval':
++                            reasoning_path, prediction = model.inference(query)
++                        elif args.generation_method == 'single_retrieval':
++                            reasoning_path, prediction = model.inference(query, qid=qid)
++                        else:
++                            reasoning_path, prediction = model.inference(query, qid=qid)
++                    except torch.OutOfMemoryError as oom:
++                        # [cluster patch] one very long context shouldn't kill a 12 h job: record it as
++                        # failed (no prediction = wrong answer) and continue with the next query
++                        msg = str(oom).split('. Including')[0]
++                        peaks = ", ".join(f"GPU{i} {torch.cuda.max_memory_allocated(i) / 2**30:.2f} GiB" for i in range(torch.cuda.device_count()))
++                        torch.cuda.empty_cache()
++                        print(f"[warn] CUDA out of memory on query {qid}; recorded with error=cuda_oom | {msg} | peak: {peaks}", flush=True)
++                        if os.environ.get('TRQA_DEBUG'):
++                            import traceback; traceback.print_exc()
++                        reasoning_path, prediction = [{'error': 'cuda_oom'}], None
+                     soft_matches = {}
+                     for pct in tolerance_percentages:
+                         match_result = soft_exact_match(prediction, gt_answer, decimals=3, tolerance_pct=pct)
+@@ -1182,7 +1193,7 @@ def main():
+ 
+     # Retriever arguments (used for pipeline=retrieval; also for pipeline=generation when generation_method is single_retrieval or deep_research)
+     parser.add_argument('--retriever', type=str, default='e5', choices=['bm25', 'spladepp', 'rerank_l6', 'rerank_l12', 'contriever', 'dpr', 'bge', 'e5', 'oracle'], help='Retriever to use (default: contriever)')
+-    parser.add_argument('--index_dir', type=str, default='/projects/0/prjs0834/heydars/CORPUS_Mahta/indices', help='Directory containing retrieval indices', choices=['corpus_datasets/corpus', '/projects/0/prjs0834/heydars/CORPUS_Mahta/indices'])
++    parser.add_argument('--index_dir', type=str, default='/projects/0/prjs0834/heydars/CORPUS_Mahta/indices', help='Directory containing retrieval indices (expects <index_dir>/bm25_index for bm25)')  # [cluster patch] removed hard-coded choices
+     parser.add_argument('--corpus_path', type=str, default='corpus_datasets/corpus/enwiki_20251001_infoboxconv_rewritten.jsonl', help='Path to corpus file')
+     parser.add_argument('--retrieval_topk', type=int, default=3, help='Number of passages passed to the LLM when using single_retrieval or deep_research (generation pipeline only). Not used for retrieval pipeline (default: 3)')
+     parser.add_argument('--retrieval_results_file', type=str, default=None, help='Optional path to TREC-format retrieval results. Used only for single_retrieval (one query per example). If provided and file exists, use it instead of running retrieval. If not provided, will check run_output/{run}/{subset_name}/retrieval_{retriever}/evaluation_results.txt. Ignored for deep_research (retrieval is always run per step).')
+@@ -1190,6 +1201,17 @@ def main():
+     parser.add_argument('--splade_max_length', type=int, default=256, help='Max token length for SPLADE query encoding; must match index build (default: 256)')
+     parser.add_argument('--faiss_gpu', action='store_true', default=False, help='Use GPU for FAISS computation')
+ 
++    # [cluster patch] model loading options for small GPUs
++    parser.add_argument('--model_dtype', type=str, default='auto', choices=['auto', 'bf16', 'fp16', 'fp32'], help='Weights dtype for local HF models. auto = bf16 on Ampere+, fp16 on older GPUs (e.g. RTX 2080 Ti).')
++    parser.add_argument('--device_map', type=str, default='none', choices=['none', 'auto', 'even'], help="Shard one model over all visible GPUs (needed for 7B models on 11 GB GPUs); use together with --devices 0. 'even' = same number of layers per GPU, 'auto' = accelerate's placement.")
++    # [cluster patch] novelty-aware search tool (Phase 2, system search_r1_novel)
++    parser.add_argument('--novelty_unit', type=str, default='none', choices=['none', 'passage', 'document'], help='Give the Search-R1 search tool a per-question memory: among the top --novelty_depth BM25 candidates, show passages (or passages of documents) not shown before in this question. none = off (baseline).')
++    parser.add_argument('--novelty_depth', type=int, default=30, help='Number of BM25 candidates per search step the novelty filter may choose from.')
++    # [cluster patch] stop notice (2x2 experiment, systems search_r1_notice and search_r1_novel_notice)
++    parser.add_argument('--stop_notice', action='store_true', help='The Search-R1 search tool adds one line after the passages when the query has nothing new left. Without --novelty_unit: the usual top-k, notice when none of them is new in this question. With --novelty_unit: only the remaining new candidates are shown (no fill-ups), notice when fewer than --retrieval_topk remain.')
++    parser.add_argument('--prefill_chunk_size', type=int, default=0, help='Encode prompts longer than this in chunks (0 = off). Saves GPU memory on long DRA contexts; same outputs.')
++    parser.add_argument('--quantization', type=str, default='none', choices=['none', '8bit', '4bit'], help='Optional bitsandbytes quantization (changes results; not used for the reproduction).')
++
+     # Other arguments
+     parser.add_argument('--max_iter', type=int, default=20, help='Maximum iterations for multi-step models (default: 10)')
+     parser.add_argument('--device', type=int, default=0, help='CUDA device ID when using single GPU (default: 0)')
+@@ -1244,6 +1266,19 @@ def main():
+     # Set retriever_name for compatibility
+     args.retriever_name = args.retriever
+ 
++    # [cluster patch] novelty filter: only defined for Search-R1
++    if args.novelty_unit != 'none':
++        if args.pipeline != 'generation' or args.generation_method != 'deep_research' or args.deep_research_model != 'search_r1':
++            parser.error("--novelty_unit needs --pipeline generation --generation_method deep_research --deep_research_model search_r1")
++        if args.novelty_depth < args.retrieval_topk:
++            parser.error(f"--novelty_depth ({args.novelty_depth}) must be >= --retrieval_topk ({args.retrieval_topk})")
++        if args.novelty_depth > max(args.retrieval_eval_ks):
++            parser.error(f"--novelty_depth ({args.novelty_depth}) must be <= max(--retrieval_eval_ks) ({max(args.retrieval_eval_ks)})")
++
++    if args.stop_notice:
++        if args.pipeline != 'generation' or args.generation_method != 'deep_research' or args.deep_research_model != 'search_r1':
++            parser.error("--stop_notice needs --pipeline generation --generation_method deep_research --deep_research_model search_r1")
++
+     # Retrieval pipeline: retrieval_topk is only for generation (LLM). For retrieval eval we retrieve max(eval_ks).
+     if args.pipeline == 'retrieval':
+         args.retrieval_topk = max(args.retrieval_eval_ks)
+@@ -1369,6 +1404,11 @@ if __name__ == "__main__":
+         multiprocessing.set_start_method("spawn")
+     except RuntimeError:
+         pass  # already set (e.g. in Jupyter)
++    # [cluster patch] Slurm sends SIGTERM at the time limit. Turn it into SystemExit so the
++    # `finally` blocks still flush the TREC run file; per-query results are already on disk,
++    # and resubmitting the same job resumes where it stopped.
++    import signal
++    signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(143))
+     sys.exit(main())
+ 
+ 
+diff --git a/c5_task_evaluation/src/llm_generator.py b/c5_task_evaluation/src/llm_generator.py
+index c6db9f4..4989580 100644
+--- a/c5_task_evaluation/src/llm_generator.py
++++ b/c5_task_evaluation/src/llm_generator.py
+@@ -65,6 +65,22 @@ class LLMGenerator_hf_local:
+         self.selfask_stopping_criteria = transformers.StoppingCriteriaList([StopOnSequence(selfask_sequences, self.tokenizer)])
+     
+     
++    def _generate_no_math_sdpa(self, input_ids, gen_kwargs):
++        # [cluster patch] forbid SDPA's O(n^2)-memory math kernel so we fail loudly instead of OOMing;
++        # if no efficient kernel can handle a call, fall back once to the default kernel choice.
++        if not torch.cuda.is_available() or getattr(LLMGenerator_hf_local, '_math_sdpa_needed', False):
++            return self.generator.generate(input_ids, **gen_kwargs)
++        from torch.nn.attention import sdpa_kernel, SDPBackend
++        try:
++            with sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]):
++                return self.generator.generate(input_ids, **gen_kwargs)
++        except RuntimeError as e:
++            if 'No available kernel' not in str(e):
++                raise
++            print(f"[warn] efficient SDPA kernel unavailable ({str(e)[:200]}); allowing the math kernel from now on", flush=True)
++            LLMGenerator_hf_local._math_sdpa_needed = True
++            return self.generator.generate(input_ids, **gen_kwargs)
++
+     def generate(
+         self,
+         messages,
+@@ -82,8 +98,12 @@ class LLMGenerator_hf_local:
+         
+         input_ids = self.tokenizer.encode(input_prompt, return_tensors='pt').to(self.device)
+         attention_mask = torch.ones_like(input_ids)
+-        outputs = self.generator.generate(
+-            input_ids,
++        debug = bool(os.environ.get('TRQA_DEBUG'))  # [cluster patch] memory diagnostics
++        if debug:
++            for i in range(torch.cuda.device_count()):
++                torch.cuda.reset_peak_memory_stats(i)
++            print(f"[gen] prompt_tokens={input_ids.shape[1]} max_new_tokens={max_new_tokens}", flush=True)
++        gen_kwargs = dict(
+             attention_mask=attention_mask,
+             max_new_tokens=max_new_tokens,
+             stopping_criteria=stopping_criteria,
+@@ -91,8 +111,17 @@ class LLMGenerator_hf_local:
+             do_sample=do_sample,
+             temperature=temperature
+         )
++        # [cluster patch] chunked prefill: long Search-R1 contexts are encoded in pieces, so the
++        # MLP activations of a 20k-token prompt don't have to fit on an 11 GB GPU at once
++        chunk = getattr(self.args, 'prefill_chunk_size', 0) or 0
++        if chunk and input_ids.shape[1] > chunk:
++            gen_kwargs['prefill_chunk_size'] = chunk
++        outputs = self._generate_no_math_sdpa(input_ids, gen_kwargs)
+         output_ = outputs[0]
+         generated_tokens = output_[input_ids.shape[1]:]
+         output_text = self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
++        if debug:
++            peaks = ", ".join(f"GPU{i} peak {torch.cuda.max_memory_allocated(i) / 2**30:.2f} GiB" for i in range(torch.cuda.device_count()))
++            print(f"[gen] new_tokens={len(generated_tokens)} | {peaks} | output={output_text[-200:]!r}", flush=True)
+         
+         return output_text, output_
+diff --git a/c5_task_evaluation/src/novelty_filter.py b/c5_task_evaluation/src/novelty_filter.py
+new file mode 100644
+index 0000000..2978197
+--- /dev/null
++++ b/c5_task_evaluation/src/novelty_filter.py
+@@ -0,0 +1,143 @@
++"""[cluster patch] Novelty-aware search tool for Search-R1 (Phase 2, system `search_r1_novel`).
++
++Search-R1's search tool is stateless: a repeated query returns the same passages. This filter gives the
++tool a per-question memory so that it prefers passages (or documents) the agent has not been shown yet.
++Only the choice of the passages shown per search step changes; retrieval (BM25) is untouched.
++
++Per search step, given the BM25 ranking of the step:
++  1. candidates = the top `depth` passages of the ranking;
++  2. unit="passage":  skip candidates that were already shown in an earlier step of this question;
++     unit="document": skip candidates from documents already shown, and keep only the best-ranked
++                      passage per document within this result list;
++  3. show the first `topk` remaining candidates, in BM25 order ("new");
++  4. if fewer than `topk` remain, fill up so the agent still gets `topk` passages: first with the
++     highest-ranked already-shown passages among the candidates ("fill_shown"), then with any other
++     skipped candidate ("fill_other", document mode only: an unseen passage of a seen document, or a
++     second passage of a document in this list), both in BM25 order. Fill-ups may break the
++     one-passage-per-document rule;
++  5. if BM25 returned fewer than `topk` hits, show what exists.
++
++Stop notice (2x2 experiment, systems `search_r1_notice` and `search_r1_novel_notice`): one line the search
++tool adds after the passages when the query has nothing new left (STOP_NOTICE).
++  - without memory (ShownTracker): the tool shows the usual BM25 top `topk`; the notice is given when none
++    of the shown passages is new in this question (also when the search has no hits);
++  - with memory (NoveltyFilter(fill=False)): step 4 is dropped, so the tool shows only the remaining new
++    candidates, possibly none; the notice is given when fewer than `topk` new candidates remain.
++
++This module has no heavy imports on purpose: the unit tests import it without the TRQA environment.
++"""
++
++UNITS = ('passage', 'document')
++STOP_NOTICE = 'No more new results for this query.'
++
++
++def passage_id(doc):
++    """Same lookup as run_evalution._get_passage_id, so ids match the ones written to the result files."""
++    for key in ('id', 'doc_id', 'passage_id', 'docid'):
++        val = doc.get(key)
++        if val is not None:
++            return str(val)
++    if 'title' in doc:
++        return str(doc['title']).strip()
++    raise KeyError("Retrieved doc has no id field. Keys: %s" % list(doc.keys()))
++
++
++def document_id(pid):
++    """Document (= entity) of a passage id: everything before the last '-'.
++    Identical to metrics.retrieval_eval_metrics.extract_entity_id (Wiki1 '18859-0054' -> '18859',
++    Ecommerce 'alcohol-23-0000' -> 'alcohol-23'); kept here so the module stays import-free."""
++    parts = pid.rsplit('-', 1)
++    return parts[0] if len(parts) > 1 else pid
++
++
++class NoveltyFilter:
++    def __init__(self, unit, depth, topk=3, doc_of=document_id, fill=True):
++        if unit not in UNITS:
++            raise ValueError(f"novelty unit must be one of {UNITS}, got {unit!r}")
++        if depth < topk:
++            raise ValueError(f"novelty depth ({depth}) must be >= the number of passages shown per step ({topk})")
++        self.unit = unit
++        self.depth = int(depth)
++        self.topk = int(topk)
++        self.doc_of = doc_of
++        self.fill = bool(fill)  # False: never fill up with already-shown passages (memory + notice)
++        self.reset()
++
++    def reset(self):
++        """Forget everything; call at the start of every question."""
++        self.shown_passages = set()
++        self.shown_documents = set()
++
++    def select(self, ranked_ids):
++        """ranked_ids: passage ids of the step's BM25 ranking, best first (at least the top `depth`).
++
++        Returns (order, info). `order` is a permutation of range(min(depth, len(ranked_ids))): the shown
++        passages first, then the remaining candidates in BM25 order. Passages below `depth` keep their
++        place. `info` is the step log. The shown passages are remembered for the next steps."""
++        n_cand = min(self.depth, len(ranked_ids))
++        cand_ids = [str(pid) for pid in ranked_ids[:n_cand]]
++
++        new, fill_shown, fill_other = [], [], []
++        docs_in_list = set()
++        for i, pid in enumerate(cand_ids):
++            if self.unit == 'passage':
++                (fill_shown if pid in self.shown_passages else new).append(i)
++                continue
++            doc = self.doc_of(pid)
++            if doc not in self.shown_documents and doc not in docs_in_list:
++                docs_in_list.add(doc)
++                new.append(i)
++            elif pid in self.shown_passages:
++                fill_shown.append(i)
++            else:
++                fill_other.append(i)
++
++        picked = [(i, 'new') for i in new[:self.topk]]
++        for pool, kind in (((fill_shown, 'fill_shown'), (fill_other, 'fill_other')) if self.fill else ()):
++            for i in pool:
++                if len(picked) >= self.topk:
++                    break
++                picked.append((i, kind))
++
++        shown_idx = [i for i, _ in picked]
++        shown_set = set(shown_idx)
++        order = shown_idx + [i for i in range(n_cand) if i not in shown_set]
++
++        for i in shown_idx:
++            self.shown_passages.add(cand_ids[i])
++            self.shown_documents.add(self.doc_of(cand_ids[i]))
++
++        info = {
++            'unit': self.unit,
++            'depth': self.depth,
++            'n_candidates': n_cand,
++            'n_new_available': len(new),
++            'n_fillups': sum(1 for _, kind in picked if kind != 'new'),
++            'shown': [{'id': cand_ids[i], 'bm25_rank': i + 1, 'kind': kind} for i, kind in picked],
++        }
++        if not self.fill:  # only logged when fill-ups are off, so the logs of search_r1_novel stay as they were
++            info['fill'] = False
++        return order, info
++
++
++class ShownTracker:
++    """Memory without paging, for the baseline + notice variant: the search tool shows what BM25 returns
++    and only keeps track of what it has shown in this question."""
++
++    def __init__(self):
++        self.reset()
++
++    def reset(self):
++        self.shown_passages = set()
++
++    def observe(self, shown_ids):
++        """Remember the shown passages; returns how many of them had not been shown before."""
++        ids = [str(pid) for pid in shown_ids]
++        n_new = sum(1 for pid in set(ids) if pid not in self.shown_passages)
++        self.shown_passages.update(ids)
++        return n_new
++
++
++def notice_info(n_shown, n_new_shown, given):
++    """Step log of the stop notice (reasoning_path[i].notice)."""
++    return {'given': bool(given), 'n_shown': int(n_shown), 'n_new_shown': int(n_new_shown)}
